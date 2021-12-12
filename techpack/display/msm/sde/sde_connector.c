@@ -38,6 +38,7 @@ static u32 dither_matrix[DITHER_MATRIX_SZ] = {
 	15, 7, 13, 5, 3, 11, 1, 9, 12, 4, 14, 6, 0, 8, 2, 10
 };
 static bool priv_dc_status = false;
+static u32 priv_panel_backlight_brightness = 80;
 static const struct drm_prop_enum_list e_topology_name[] = {
 	{SDE_RM_TOPOLOGY_NONE,	"sde_none"},
 	{SDE_RM_TOPOLOGY_SINGLEPIPE,	"sde_singlepipe"},
@@ -796,12 +797,15 @@ void sde_connector_update_fod_hbm(struct drm_connector *connector)
 
 	mutex_lock(&display->panel->panel_lock);
     if(status){
+		priv_panel_backlight_brightness = display->panel->bl_config.bl_level;
         priv_dc_status = display->panel->mi_cfg.dc_enable;
         dsi_panel_set_dc(display->panel, false);
     }
 	dsi_panel_set_fod_hbm(display->panel, status);
     if((!status) && priv_dc_status)
         dsi_panel_set_dc(display->panel, true);
+	if(!status)
+		dsi_panel_set_backlight(display->panel, priv_panel_backlight_brightness);
 	mutex_unlock(&display->panel->panel_lock);
 	dsi_display_set_fod_ui(display, status);
 }
