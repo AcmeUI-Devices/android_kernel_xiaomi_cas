@@ -796,8 +796,8 @@ void sde_connector_update_fod_hbm(struct drm_connector *connector)
 		return;
 
 	mutex_lock(&display->panel->panel_lock);
+	priv_panel_backlight_brightness = display->panel->bl_config.bl_level;
     if(status){
-		priv_panel_backlight_brightness = display->panel->bl_config.bl_level;
         priv_dc_status = display->panel->mi_cfg.dc_enable;
         dsi_panel_set_dc(display->panel, false);
     }
