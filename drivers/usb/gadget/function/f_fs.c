@@ -1405,7 +1405,6 @@ static long ffs_epfile_ioctl(struct file *file, unsigned code,
 		struct usb_endpoint_descriptor desc1, *desc;
 
 		switch (epfile->ffs->gadget->speed) {
-		case USB_SPEED_SUPER_PLUS:
 		case USB_SPEED_SUPER:
 		case USB_SPEED_SUPER_PLUS:
 			desc_idx = 2;
@@ -2096,9 +2095,6 @@ static void ffs_func_eps_disable(struct ffs_function *func)
 	struct ffs_epfile *epfile;
 	unsigned short count;
 	unsigned long flags;
-
-	ffs_log("enter: state %d setup_state %d flag %lu", func->ffs->state,
-		func->ffs->setup_state, func->ffs->flags);
 
 	spin_lock_irqsave(&func->ffs->eps_lock, flags);
 	count = func->ffs->eps_count;
@@ -3273,7 +3269,6 @@ static inline struct f_fs_opts *ffs_do_functionfs_bind(struct usb_function *f,
 	if (!ffs_opts->refcnt) {
 		ret = functionfs_bind(func->ffs, c->cdev);
 		if (ret) {
-			ffs_log("functionfs_bind returned %d", ret);
 			return ERR_PTR(ret);
 		}
 	}
