@@ -885,15 +885,7 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 		if (mi_cfg->fod_backlight_flag) {
 			DSI_INFO("fod_backlight_flag set, skip set backlight %d\n", bl_lvl);
 		} else {
-			if (mi_cfg->hbm_51_ctrl_flag &&
-				(mi_cfg->fod_hbm_enabled || (mi_cfg->thermal_hbm_disabled && bl_lvl > 2047)
-				|| (mi_cfg->hbm_enabled && !mi_cfg->hbm_brightness))) {
-				DSI_INFO("fod_hbm_enabled(%d),hbm_enabled(%d),"
-					"skip set backlight %d\n", mi_cfg->fod_hbm_enabled,
-					mi_cfg->hbm_enabled, bl_lvl);
-			} else {
-				rc = dsi_panel_update_backlight(panel, bl_lvl);
-			}
+			rc = dsi_panel_update_backlight(panel, bl_lvl);
 		}
 		break;
 	case DSI_BACKLIGHT_EXTERNAL:
