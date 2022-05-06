@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/arm64 4.19.237 Kernel Configuration
+# Linux/arm64 4.19.241 Kernel Configuration
 #
 
 #
@@ -2285,7 +2285,6 @@ CONFIG_CNSS_GENL=y
 # CONFIG_VMXNET3 is not set
 # CONFIG_NET_FAILOVER is not set
 # CONFIG_ISDN is not set
-# CONFIG_NVM is not set
 
 #
 # Input device support
