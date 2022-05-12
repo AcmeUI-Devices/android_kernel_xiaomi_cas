@@ -2125,9 +2125,6 @@ static int ffs_func_eps_enable(struct ffs_function *func)
 	unsigned long flags;
 	int ret = 0;
 
-	ffs_log("enter: state %d setup_state %d flag %lu", func->ffs->state,
-		func->ffs->setup_state, func->ffs->flags);
-
 	spin_lock_irqsave(&func->ffs->eps_lock, flags);
 	ffs = func->ffs;
 	ep = func->eps;
@@ -2148,9 +2145,7 @@ static int ffs_func_eps_enable(struct ffs_function *func)
 			epfile->ep = ep;
 			epfile->in = usb_endpoint_dir_in(ep->ep->desc);
 			epfile->isoc = usb_endpoint_xfer_isoc(ep->ep->desc);
-			ffs_log("usb_ep_enable %s", ep->ep->name);
 		} else {
-			ffs_log("usb_ep_enable %s ret %d", ep->ep->name, ret);
 			break;
 		}
 
