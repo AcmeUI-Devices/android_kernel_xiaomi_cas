@@ -1207,8 +1207,7 @@ static int move_data_block(struct inode *inode, block_t bidx,
 	}
 
 	if (f2fs_is_pinned_file(inode)) {
-		if (gc_type == FG_GC)
-			f2fs_pin_file_control(inode, true);
+		f2fs_pin_file_control(inode, true);
 		err = -EAGAIN;
 		goto out;
 	}
