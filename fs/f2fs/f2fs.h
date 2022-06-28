@@ -3773,6 +3773,7 @@ int f2fs_init_bio_entry_cache(void);
 void f2fs_destroy_bio_entry_cache(void);
 void f2fs_submit_bio(struct f2fs_sb_info *sbi,
 				struct bio *bio, enum page_type type);
+int f2fs_init_write_merge_io(struct f2fs_sb_info *sbi);
 void f2fs_submit_merged_write(struct f2fs_sb_info *sbi, enum page_type type);
 void f2fs_submit_merged_write_cond(struct f2fs_sb_info *sbi,
 				struct inode *inode, struct page *page,
@@ -4477,8 +4478,8 @@ static inline bool f2fs_may_compress(struct inode *inode)
 static inline void f2fs_i_compr_blocks_update(struct inode *inode,
 						u64 blocks, bool add)
 {
-	int diff = F2FS_I(inode)->i_cluster_size - blocks;
 	struct f2fs_inode_info *fi = F2FS_I(inode);
+	int diff = fi->i_cluster_size - blocks;
 
 	/* don't update i_compr_blocks if saved blocks were released */
 	if (!add && !atomic_read(&fi->i_compr_blocks))
