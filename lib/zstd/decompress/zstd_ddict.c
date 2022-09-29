@@ -1,5 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0+ OR BSD-3-Clause
 /*
- * Copyright (c) Yann Collet, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -19,7 +20,6 @@
 #include "../common/mem.h"         /* low level memory routines */
 #define FSE_STATIC_LINKING_ONLY
 #include "../common/fse.h"
-#define HUF_STATIC_LINKING_ONLY
 #include "../common/huf.h"
 #include "zstd_decompress_internal.h"
 #include "zstd_ddict.h"
@@ -237,5 +237,5 @@ size_t ZSTD_sizeof_DDict(const ZSTD_DDict* ddict)
 unsigned ZSTD_getDictID_fromDDict(const ZSTD_DDict* ddict)
 {
     if (ddict==NULL) return 0;
-    return ZSTD_getDictID_fromDict(ddict->dictContent, ddict->dictSize);
+    return ddict->dictID;
 }
