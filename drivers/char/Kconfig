@@ -624,8 +624,6 @@ config RB5_GPIOS_ENABLE
 	  signals, GPIO 60 is default set to low to connect GPIOs
 	  140/145,116/117 to mezzanine connectors.
 
-endmenu
-
 config RANDOM_TRUST_CPU
 	bool "Initialize RNG using CPU RNG instructions"
 	default y
@@ -709,3 +707,5 @@ config RANDOM_TRUST_BOOTLOADER
 	  Say Y here unless you have reason to mistrust your bootloader or
 	  believe its RNG facilities may be faulty. This may also be configured
 	  at boot time with "random.trust_bootloader=on/off".
+
+endmenu

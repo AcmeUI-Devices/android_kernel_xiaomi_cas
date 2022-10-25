@@ -294,6 +294,9 @@ static void __cqhci_enable(struct cqhci_host *cq_host)
 	cqcfg |= CQHCI_ENABLE;
 	cqhci_writel(cq_host, cqcfg, CQHCI_CFG);
 
+	if (cqhci_readl(cq_host, CQHCI_CTL) & CQHCI_HALT)
+		cqhci_writel(cq_host, 0, CQHCI_CTL);
+
 	cqhci_writel(cq_host, lower_32_bits(cq_host->desc_dma_base),
 		     CQHCI_TDLBA);
 	cqhci_writel(cq_host, upper_32_bits(cq_host->desc_dma_base),
@@ -305,9 +308,6 @@ static void __cqhci_enable(struct cqhci_host *cq_host)
 	cqhci_writel(cq_host, SEND_QSR_INTERVAL, CQHCI_SSC1);
 
 	cqhci_set_irqs(cq_host, 0);
-
-	if (cqhci_readl(cq_host, CQHCI_CTL) & CQHCI_HALT)
-		cqhci_writel(cq_host, 0, CQHCI_CTL);
 
 	mmc->cqe_on = true;
 
