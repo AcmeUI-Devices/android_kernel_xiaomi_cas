@@ -418,8 +418,6 @@ unsigned int tcp_xmit_size_goal(struct sock *sk, u32 mss_now,
 				       int large_allowed);
 u32 tcp_tso_acked(struct sock *sk, struct sk_buff *skb);
 
-void skb_clone_fraglist(struct sk_buff *skb);
-
 void inet_twsk_free(struct inet_timewait_sock *tw);
 int tcp_v6_conn_request(struct sock *sk, struct sk_buff *skb);
 /* These states need RST on ABORT according to RFC793 */
@@ -1551,10 +1549,10 @@ static inline int tcp_win_from_space(const struct sock *sk, int space)
 }
 
 #ifdef CONFIG_MPTCP
-extern struct static_key mptcp_static_key;
+DECLARE_STATIC_KEY_FALSE(mptcp_static_key);
 static inline bool mptcp(const struct tcp_sock *tp)
 {
-	return static_key_false(&mptcp_static_key) && tp->mpc;
+	return static_branch_unlikely(&mptcp_static_key) && tp->mpc;
 }
 #else
 static inline bool mptcp(const struct tcp_sock *tp)

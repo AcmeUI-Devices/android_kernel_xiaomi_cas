@@ -74,7 +74,7 @@ int sysctl_mptcp_syn_retries __read_mostly = 3;
 
 bool mptcp_init_failed __read_mostly;
 
-struct static_key mptcp_static_key = STATIC_KEY_INIT_FALSE;
+DEFINE_STATIC_KEY_FALSE(mptcp_static_key);
 EXPORT_SYMBOL(mptcp_static_key);
 
 static void mptcp_key_sha1(u64 key, u32 *token, u64 *idsn);
@@ -384,71 +384,14 @@ static void mptcp_set_key_sk(const struct sock *sk)
 		       &tp->mptcp_loc_token, NULL);
 }
 
-#ifdef CONFIG_JUMP_LABEL
-static atomic_t mptcp_needed_deferred;
-static atomic_t mptcp_wanted;
-
-static void mptcp_clear(struct work_struct *work)
-{
-	int deferred = atomic_xchg(&mptcp_needed_deferred, 0);
-	int wanted;
-
-	wanted = atomic_add_return(deferred, &mptcp_wanted);
-	if (wanted > 0)
-		static_key_enable(&mptcp_static_key);
-	else
-		static_key_disable(&mptcp_static_key);
-}
-
-static DECLARE_WORK(mptcp_work, mptcp_clear);
-#endif
-
-static void mptcp_enable_static_key_bh(void)
-{
-#ifdef CONFIG_JUMP_LABEL
-	int wanted;
-
-	while (1) {
-		wanted = atomic_read(&mptcp_wanted);
-		if (wanted <= 0)
-			break;
-		if (atomic_cmpxchg(&mptcp_wanted, wanted, wanted + 1) == wanted)
-			return;
-	}
-	atomic_inc(&mptcp_needed_deferred);
-	schedule_work(&mptcp_work);
-#else
-	static_key_slow_inc(&mptcp_static_key);
-#endif
-}
-
 static void mptcp_enable_static_key(void)
 {
-#ifdef CONFIG_JUMP_LABEL
-	atomic_inc(&mptcp_wanted);
-	static_key_enable(&mptcp_static_key);
-#else
-	static_key_slow_inc(&mptcp_static_key);
-#endif
-}
+	if (!static_branch_unlikely(&mptcp_static_key)) {
+		static int __mptcp_static_key = 0;
 
-void mptcp_disable_static_key(void)
-{
-#ifdef CONFIG_JUMP_LABEL
-	int wanted;
-
-	while (1) {
-		wanted = atomic_read(&mptcp_wanted);
-		if (wanted <= 1)
-			break;
-		if (atomic_cmpxchg(&mptcp_wanted, wanted, wanted - 1) == wanted)
-			return;
+		if (cmpxchg(&__mptcp_static_key, 0, 1) == 0)
+			static_branch_enable(&mptcp_static_key);
 	}
-	atomic_dec(&mptcp_needed_deferred);
-	schedule_work(&mptcp_work);
-#else
-	static_key_slow_dec(&mptcp_static_key);
-#endif
 }
 
 void mptcp_enable_sock(struct sock *sk)
@@ -489,8 +432,6 @@ void mptcp_disable_sock(struct sock *sk)
 		else
 			inet_csk(sk)->icsk_af_ops = &ipv6_specific;
 #endif
-
-		mptcp_disable_static_key();
 	}
 }
 
@@ -709,8 +650,6 @@ static void mptcp_sock_destruct(struct sock *sk)
 
 		mptcp_mpcb_cleanup(tp->mpcb);
 	}
-
-	WARN_ON(!static_key_false(&mptcp_static_key));
 
 	/* Must be called here, because this will decrement the jump-label. */
 	inet_sock_destruct(sk);
@@ -1171,6 +1110,27 @@ static const struct tcp_sock_ops mptcp_sub_specific = {
 	.set_cong_ctrl                  = __tcp_set_congestion_control,
 };
 
+/* Inspired by inet_csk_prepare_forced_close */
+static void mptcp_icsk_forced_close(struct sock *sk)
+{
+	/* The problem with inet_csk_prepare_forced_close is that it unlocks
+	 * before calling tcp_done. That is fine for sockets that are not
+	 * yet in the ehash table. But for us we already are there. Thus,
+	 * if we unlock we run the risk of processing packets while inside
+	 * tcp_done() and friends. That can cause all kind of problems...
+	 */
+
+	/* The below has to be done to allow calling inet_csk_destroy_sock */
+	sock_set_flag(sk, SOCK_DEAD);
+	percpu_counter_inc(sk->sk_prot->orphan_count);
+
+	tcp_done(sk);
+
+	/* sk_clone_lock locked the socket and set refcnt to 2 */
+	bh_unlock_sock(sk);
+	sock_put(sk);
+}
+
 static int mptcp_alloc_mpcb(struct sock *meta_sk, __u64 remote_key,
 			    __u8 mptcp_ver, u32 window)
 {
@@ -1188,19 +1148,44 @@ static int mptcp_alloc_mpcb(struct sock *meta_sk, __u64 remote_key,
 	meta_tp->is_master_sk = 1;
 	master_sk = sk_clone_lock(meta_sk, GFP_ATOMIC | __GFP_ZERO);
 	meta_tp->is_master_sk = 0;
-	if (!master_sk)
+	if (!master_sk) {
+		net_err_ratelimited("%s Could not allocate master_sk on meta %p\n",
+				    __func__, meta_sk);
 		goto err_alloc_master;
+	}
 
 	/* Same as in inet_csk_clone_lock - need to init to 0 */
 	memset(&inet_csk(master_sk)->icsk_accept_queue, 0,
 	       sizeof(inet_csk(master_sk)->icsk_accept_queue));
 
+	/* icsk_bind_hash inherited from the meta, but it will be properly set
+	 * in mptcp_create_master_sk. Same operation is done in
+	 * inet_csk_clone_lock.
+	 */
+	inet_csk(master_sk)->icsk_bind_hash = NULL;
+
 	master_tp = tcp_sk(master_sk);
 	master_tp->inside_tk_table = 0;
 
+	master_tp->mptcp = kmem_cache_zalloc(mptcp_sock_cache, GFP_ATOMIC);
+	if (!master_tp->mptcp) {
+		net_err_ratelimited("%s Could not allocate mptcp_tcp_sock on meta %p\n",
+				    __func__, meta_sk);
+		goto err_alloc_mptcp;
+	}
+
 	mpcb = kmem_cache_zalloc(mptcp_cb_cache, GFP_ATOMIC);
-	if (!mpcb)
+	if (!mpcb) {
+		net_err_ratelimited("%s Could not allocate mpcb on meta %p\n",
+				    __func__, meta_sk);
 		goto err_alloc_mpcb;
+	}
+
+	if (__inet_inherit_port(meta_sk, master_sk) < 0) {
+		net_err_ratelimited("%s Could not inherit port on meta %p\n",
+				    __func__, meta_sk);
+		goto err_inherit_port;
+	}
 
 	/* Store the mptcp version agreed on initial handshake */
 	mpcb->mptcp_ver = mptcp_ver;
@@ -1361,10 +1346,6 @@ static int mptcp_alloc_mpcb(struct sock *meta_sk, __u64 remote_key,
 	master_tp->fastopen_req = NULL;
 
 	master_sk->sk_tsq_flags = 0;
-	/* icsk_bind_hash inherited from the meta, but it will be properly set in
-	 * mptcp_create_master_sk. Same operation is done in inet_csk_clone_lock.
-	 */
-	inet_csk(master_sk)->icsk_bind_hash = NULL;
 
 	/* Init the accept_queue structure, we support a queue of 32 pending
 	 * connections, it does not need to be huge, since we only store  here
@@ -1374,10 +1355,8 @@ static int mptcp_alloc_mpcb(struct sock *meta_sk, __u64 remote_key,
 	meta_sk->sk_max_ack_backlog = 32;
 	meta_sk->sk_ack_backlog = 0;
 
-	if (!sock_flag(meta_sk, SOCK_MPTCP)) {
-		mptcp_enable_static_key_bh();
+	if (!sock_flag(meta_sk, SOCK_MPTCP))
 		sock_set_flag(meta_sk, SOCK_MPTCP);
-	}
 
 	/* Redefine function-pointers as the meta-sk is now fully ready */
 	meta_tp->mpc = 1;
@@ -1411,7 +1390,20 @@ static int mptcp_alloc_mpcb(struct sock *meta_sk, __u64 remote_key,
 err_insert_token:
 	kmem_cache_free(mptcp_cb_cache, mpcb);
 
+	kmem_cache_free(mptcp_sock_cache, master_tp->mptcp);
+	master_tp->mptcp = NULL;
+
+	mptcp_icsk_forced_close(master_sk);
+	return -EINVAL;
+
+err_inherit_port:
+	kmem_cache_free(mptcp_cb_cache, mpcb);
+
 err_alloc_mpcb:
+	kmem_cache_free(mptcp_sock_cache, master_tp->mptcp);
+	master_tp->mptcp = NULL;
+
+err_alloc_mptcp:
 	inet_sk(master_sk)->inet_opt = NULL;
 	master_sk->sk_state = TCP_CLOSE;
 	sock_orphan(master_sk);
@@ -1445,14 +1437,19 @@ int mptcp_add_sock(struct sock *meta_sk, struct sock *sk, u8 loc_id, u8 rem_id,
 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
 	struct tcp_sock *tp = tcp_sk(sk);
 
-	tp->mptcp = kmem_cache_zalloc(mptcp_sock_cache, flags);
-	if (!tp->mptcp)
-		return -ENOMEM;
+	/* Could have been allocated by mptcp_alloc_mpcb */
+	if (!tp->mptcp) {
+		tp->mptcp = kmem_cache_zalloc(mptcp_sock_cache, flags);
+
+		if (!tp->mptcp)
+			return -ENOMEM;
+	}
 
 	tp->mptcp->path_index = mptcp_set_new_pathindex(mpcb);
 	/* No more space for more subflows? */
 	if (!tp->mptcp->path_index) {
 		kmem_cache_free(mptcp_sock_cache, tp->mptcp);
+		tp->mptcp = NULL;
 		return -EPERM;
 	}
 
@@ -1462,10 +1459,8 @@ int mptcp_add_sock(struct sock *meta_sk, struct sock *sk, u8 loc_id, u8 rem_id,
 	tp->mpcb = mpcb;
 	tp->meta_sk = meta_sk;
 
-	if (!sock_flag(sk, SOCK_MPTCP)) {
-		mptcp_enable_static_key_bh();
+	if (!sock_flag(sk, SOCK_MPTCP))
 		sock_set_flag(sk, SOCK_MPTCP);
-	}
 
 	tp->mpc = 1;
 	tp->ops = &mptcp_sub_specific;
@@ -1677,6 +1672,7 @@ static int mptcp_sub_send_fin(struct sock *sk)
 		/* FIN eats a sequence byte, write_seq advanced by tcp_queue_skb(). */
 		tcp_init_nondata_skb(skb, tp->write_seq,
 				     TCPHDR_ACK | TCPHDR_FIN);
+		sk_forced_mem_schedule(sk, skb->truesize);
 		tcp_queue_skb(sk, skb);
 	}
 	__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_OFF);
@@ -2021,8 +2017,7 @@ void mptcp_disconnect(struct sock *meta_sk)
 	mptcp_for_each_sub_safe(meta_tp->mpcb, mptcp, tmp) {
 		struct sock *subsk = mptcp_to_sock(mptcp);
 
-		if (spin_is_locked(&subsk->sk_lock.slock))
-			bh_unlock_sock(subsk);
+		BUG_ON(spin_is_locked(&subsk->sk_lock.slock));
 
 		tcp_sk(subsk)->tcp_disconnect = 1;
 
@@ -2098,11 +2093,10 @@ int mptcp_create_master_sk(struct sock *meta_sk, __u64 remote_key,
 	master_sk = tcp_sk(meta_sk)->mpcb->master_sk;
 	master_tp = tcp_sk(master_sk);
 
-	if (mptcp_add_sock(meta_sk, master_sk, 0, 0, GFP_ATOMIC))
-		goto err_add_sock;
-
-	if (__inet_inherit_port(meta_sk, master_sk) < 0)
-		goto err_add_sock;
+	if (mptcp_add_sock(meta_sk, master_sk, 0, 0, GFP_ATOMIC)) {
+		WARN_ON(1);
+		return -EINVAL;
+	}
 
 	meta_sk->sk_prot->unhash(meta_sk);
 	inet_ehash_nolisten(master_sk, NULL, NULL);
@@ -2110,10 +2104,6 @@ int mptcp_create_master_sk(struct sock *meta_sk, __u64 remote_key,
 	master_tp->mptcp->init_rcv_wnd = master_tp->rcv_wnd;
 
 	return 0;
-
-err_add_sock:
-	inet_csk_prepare_forced_close(master_sk);
-	tcp_done(master_sk);
 
 err_alloc_mpcb:
 	return -ENOBUFS;
@@ -2151,8 +2141,7 @@ static int __mptcp_check_req_master(struct sock *child,
 
 	if (mptcp_create_master_sk(meta_sk, mtreq->mptcp_rem_key,
 				   mtreq->mptcp_ver, child_tp->snd_wnd)) {
-		inet_csk_prepare_forced_close(meta_sk);
-		tcp_done(meta_sk);
+		mptcp_icsk_forced_close(meta_sk);
 
 		return -ENOBUFS;
 	}
@@ -2171,9 +2160,6 @@ static int __mptcp_check_req_master(struct sock *child,
 	 * new connection we pass by __reqsk_free and not reqsk_free.
 	 */
 	mptcp_reqsk_remove_tk(req);
-
-	/* Hold when creating the meta-sk in tcp_vX_syn_recv_sock. */
-	sock_put(meta_sk);
 
 	return 0;
 }
@@ -2250,9 +2236,7 @@ int mptcp_check_req_master(struct sock *sk, struct sock *child,
 		reqsk_queue_removed(&inet_csk(sk)->icsk_accept_queue, req);
 		if (!inet_csk_reqsk_queue_add(sk, req, meta_sk)) {
 			bh_unlock_sock(meta_sk);
-			/* No sock_put() of the meta needed. The reference has
-			 * already been dropped in __mptcp_check_req_master().
-			 */
+			sock_put(meta_sk);
 			sock_put(child);
 			return -1;
 		}
@@ -2262,14 +2246,14 @@ int mptcp_check_req_master(struct sock *sk, struct sock *child,
 		tcp_sk(meta_sk)->tsoffset = tsoff;
 		if (!inet_csk_reqsk_queue_add(sk, req, meta_sk)) {
 			bh_unlock_sock(meta_sk);
-			/* No sock_put() of the meta needed. The reference has
-			 * already been dropped in __mptcp_check_req_master().
-			 */
+			sock_put(meta_sk);
 			sock_put(child);
 			reqsk_put(req);
 			return -1;
 		}
 	}
+
+	sock_put(meta_sk);
 
 	return 0;
 }
@@ -2324,6 +2308,7 @@ struct sock *mptcp_check_req_child(struct sock *meta_sk,
 	 * some of the fields
 	 */
 	child_tp->mptcp->rcv_low_prio = mtreq->rcv_low_prio;
+	child_tp->mptcp->low_prio = mtreq->low_prio;
 
 	/* We should allow proper increase of the snd/rcv-buffers. Thus, we
 	 * use the original values instead of the bloated up ones from the
@@ -2366,9 +2351,11 @@ teardown:
 	/* Drop this request - sock creation failed. */
 	inet_csk_reqsk_queue_drop(meta_sk, req);
 	reqsk_queue_removed(&inet_csk(meta_sk)->icsk_accept_queue, req);
-	inet_csk_prepare_forced_close(child);
-	tcp_done(child);
+
+	mptcp_icsk_forced_close(child);
+
 	bh_unlock_sock(meta_sk);
+
 	return meta_sk;
 }
 
@@ -3146,3 +3133,15 @@ mptcp_cb_cache_failed:
 mptcp_sock_cache_failed:
 	mptcp_init_failed = true;
 }
+
+#ifdef CONFIG_MPTCP_DEBUG_LOCK
+void mptcp_check_lock(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	/* make sure the meta lock is held when we hold the sublock */
+	if (mptcp(tp) && !is_meta_tp(tp) && tp->meta_sk)
+		WARN_ON(!spin_is_locked(&tp->meta_sk->sk_lock.slock) &&
+			!sock_owned_by_user(tp->meta_sk));
+}
+EXPORT_SYMBOL(mptcp_check_lock);
+#endif
