@@ -8,8 +8,12 @@ obj-y += uid_observer.o
 obj-y += manager.o
 obj-y += core_hook.o
 obj-y += ksud.o
+obj-y += embed_ksud.o
+obj-y += kernel_compat.o
 
 obj-y += selinux/
+KSU_GIT_VERSION := 423
+ccflags-y += -DKSU_GIT_VERSION=$(KSU_GIT_VERSION)
 
 ifndef EXPECTED_SIZE
 EXPECTED_SIZE := 0x033b
