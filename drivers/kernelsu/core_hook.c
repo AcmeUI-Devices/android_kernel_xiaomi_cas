@@ -35,6 +35,16 @@ static inline bool is_allow_su()
 	return ksu_is_allow_uid(current_uid().val);
 }
 
+static inline bool is_isolated_uid(uid_t uid) {
+    #define FIRST_ISOLATED_UID 99000
+    #define LAST_ISOLATED_UID 99999
+    #define FIRST_APP_ZYGOTE_ISOLATED_UID 90000
+    #define LAST_APP_ZYGOTE_ISOLATED_UID 98999
+    uid_t appid = uid % 100000;
+    return (appid >= FIRST_ISOLATED_UID && appid <= LAST_ISOLATED_UID)
+                || (appid >= FIRST_APP_ZYGOTE_ISOLATED_UID && appid <= LAST_APP_ZYGOTE_ISOLATED_UID);
+}
+
 static struct group_info root_groups = { .usage = ATOMIC_INIT(2) };
 
 void escape_to_root(void)
@@ -124,7 +134,17 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 		return 0;
 	}
 
-	pr_info("option: 0x%x, cmd: %ld\n", option, arg2);
+	// always ignore isolated app uid
+	if (is_isolated_uid(current_uid().val)) {
+		return 0;
+	}
+
+	static uid_t last_failed_uid = -1;
+	if (last_failed_uid == current_uid().val) {
+		return 0;
+	}
+
+	// pr_info("option: 0x%x, cmd: %ld\n", option, arg2);
 
 	if (arg2 == CMD_BECOME_MANAGER) {
 		// quick check
@@ -200,9 +220,9 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 			u32 version = KERNEL_SU_VERSION;
 			if (copy_to_user(arg3, &version, sizeof(version))) {
 				pr_err("prctl reply error, cmd: %d\n", arg2);
-				return 0;
 			}
 		}
+		return 0;
 	}
 
 	if (arg2 == CMD_REPORT_EVENT) {
@@ -234,6 +254,9 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 	}
 
 	if (arg2 == CMD_SET_SEPOLICY) {
+		if (0 != current_uid().val) {
+			return 0;
+		}
 		if (!handle_sepolicy(arg3, arg4)) {
 			if (copy_to_user(result, &reply_ok, sizeof(reply_ok))) {
 				pr_err("sepolicy: prctl reply error\n");
@@ -244,6 +267,9 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 	}
 
 	if (arg2 == CMD_CHECK_SAFEMODE) {
+		if (!is_manager() && 0 != current_uid().val) {
+			return 0;
+		}
 		if (ksu_is_safe_mode()) {
 			pr_warn("safemode enabled!\n");
 			if (copy_to_user(result, &reply_ok, sizeof(reply_ok))) {
@@ -253,9 +279,34 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 		return 0;
 	}
 
+	if (arg2 == CMD_GET_ALLOW_LIST || arg2 == CMD_GET_DENY_LIST) {
+		if (is_manager() || 0 == current_uid().val) {
+			u32 array[128];
+			u32 array_length;
+			bool success =
+				ksu_get_allow_list(array, &array_length,
+						   arg2 == CMD_GET_ALLOW_LIST);
+			if (success) {
+				if (!copy_to_user(arg4, &array_length,
+						  sizeof(array_length)) &&
+				    !copy_to_user(arg3, array,
+						  sizeof(u32) * array_length)) {
+					if (copy_to_user(result, &reply_ok,
+							 sizeof(reply_ok))) {
+						pr_err("prctl reply error, cmd: %d\n",
+						       arg2);
+					}
+				} else {
+					pr_err("prctl copy allowlist error\n");
+				}
+			}
+		}
+		return 0;
+	}
+
 	// all other cmds are for 'root manager'
 	if (!is_manager()) {
-		pr_info("Only manager can do cmd: %d\n", arg2);
+		last_failed_uid = current_uid().val;
 		return 0;
 	}
 
@@ -271,25 +322,7 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 			}
 		}
 		ksu_show_allow_list();
-	} else if (arg2 == CMD_GET_ALLOW_LIST || arg2 == CMD_GET_DENY_LIST) {
-		u32 array[128];
-		u32 array_length;
-		bool success = ksu_get_allow_list(array, &array_length,
-						  arg2 == CMD_GET_ALLOW_LIST);
-		if (success) {
-			if (!copy_to_user(arg4, &array_length,
-					  sizeof(array_length)) &&
-			    !copy_to_user(arg3, array,
-					  sizeof(u32) * array_length)) {
-				if (copy_to_user(result, &reply_ok,
-						  sizeof(reply_ok))) {
-					pr_err("prctl reply error, cmd: %d\n",
-					       arg2);
-				}
-			} else {
-				pr_err("prctl copy allowlist error\n");
-			}
-		}
+		return 0;
 	}
 
 	return 0;
@@ -369,16 +402,13 @@ static int ksu_task_prctl(int option, unsigned long arg2, unsigned long arg3,
 }
 // kernel 4.4 and 4.9
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
-static int ksu_key_permission(key_ref_t key_ref,
-				  const struct cred *cred,
-				  unsigned perm)
+static int ksu_key_permission(key_ref_t key_ref, const struct cred *cred,
+			      unsigned perm)
 {
-	if (init_session_keyring != NULL)
-	{
+	if (init_session_keyring != NULL) {
 		return 0;
 	}
-	if (strcmp(current->comm, "init"))
-	{
+	if (strcmp(current->comm, "init")) {
 		// we are only interested in `init` process
 		return 0;
 	}

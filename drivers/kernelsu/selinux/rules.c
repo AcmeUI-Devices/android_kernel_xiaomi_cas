@@ -22,7 +22,7 @@ static struct policydb *get_policydb(void)
 {
 	struct policydb *db;
 // selinux_state does not exists before 4.19
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 212)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 337)
 #ifdef SELINUX_POLICY_INSTEAD_SELINUX_SS
 	struct selinux_policy *policy = rcu_dereference(selinux_state.policy);
 	db = &policy->policydb;
@@ -170,7 +170,7 @@ static int get_object(char *buf, char __user *user_object, size_t buf_sz,
 
 // reset avc cache table, otherwise the new rules will not take effect if already denied
 static void reset_avc_cache() {
-#if ((KERNEL_VERSION(4, 14, 0) <= LINUX_VERSION_CODE) && (LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 163))) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 212))
+#if ((KERNEL_VERSION(4, 14, 0) <= LINUX_VERSION_CODE) && (LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 163))) || (LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 337))
 	avc_ss_reset(0);
 	selnl_notify_policyload(0);
 	selinux_status_update_policyload(0);
@@ -191,7 +191,7 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4)
 
 	if (!getenforce()) {
 		pr_info("SELinux permissive or disabled, don't apply policies.");
-		return -1;
+		return 0;
 	}
 
 	struct sepol_data data;
@@ -451,7 +451,7 @@ int handle_sepolicy(unsigned long arg3, void __user *arg4)
 		}
 		ret = 0;
 	} else {
-		pr_err("sepol: unknown cmd: %d");
+		pr_err("sepol: unknown cmd: %d\n", cmd);
 	}
 
 exit:
