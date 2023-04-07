@@ -713,7 +713,6 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 
 	erofs_shrinker_register(sb);
 	/* sb->s_umount is already locked, SB_ACTIVE and SB_BORN are not set */
-#ifdef CONFIG_EROFS_FS_ZIP
 	if (erofs_sb_has_fragments(sbi) && sbi->packed_nid) {
 		sbi->packed_inode = erofs_iget(sb, sbi->packed_nid);
 		if (IS_ERR(sbi->packed_inode)) {
@@ -722,7 +721,6 @@ static int erofs_fill_super(struct super_block *sb, void *data, int silent)
 			return err;
 		}
 	}
-#endif
 	err = erofs_init_managed_cache(sb);
 	if (err)
 		return err;
@@ -795,9 +793,9 @@ static void erofs_put_super(struct super_block *sb)
 #ifdef CONFIG_EROFS_FS_ZIP
 	iput(sbi->managed_cache);
 	sbi->managed_cache = NULL;
+#endif
 	iput(sbi->packed_inode);
 	sbi->packed_inode = NULL;
-#endif
 }
 
 static struct file_system_type erofs_fs_type = {
