@@ -1,13 +1,18 @@
+#include "linux/capability.h"
 #include "linux/cred.h"
+#include "linux/dcache.h"
 #include "linux/err.h"
 #include "linux/init.h"
 #include "linux/kernel.h"
 #include "linux/kprobes.h"
 #include "linux/lsm_hooks.h"
+#include "linux/nsproxy.h"
+#include "linux/path.h"
 #include "linux/printk.h"
 #include "linux/uaccess.h"
 #include "linux/uidgid.h"
 #include "linux/version.h"
+#include "linux/mount.h"
 
 #include "linux/fs.h"
 #include "linux/namei.h"
@@ -35,17 +40,62 @@ static inline bool is_allow_su()
 	return ksu_is_allow_uid(current_uid().val);
 }
 
-static inline bool is_isolated_uid(uid_t uid) {
-    #define FIRST_ISOLATED_UID 99000
-    #define LAST_ISOLATED_UID 99999
-    #define FIRST_APP_ZYGOTE_ISOLATED_UID 90000
-    #define LAST_APP_ZYGOTE_ISOLATED_UID 98999
-    uid_t appid = uid % 100000;
-    return (appid >= FIRST_ISOLATED_UID && appid <= LAST_ISOLATED_UID)
-                || (appid >= FIRST_APP_ZYGOTE_ISOLATED_UID && appid <= LAST_APP_ZYGOTE_ISOLATED_UID);
+static inline bool is_isolated_uid(uid_t uid)
+{
+#define FIRST_ISOLATED_UID 99000
+#define LAST_ISOLATED_UID 99999
+#define FIRST_APP_ZYGOTE_ISOLATED_UID 90000
+#define LAST_APP_ZYGOTE_ISOLATED_UID 98999
+	uid_t appid = uid % 100000;
+	return (appid >= FIRST_ISOLATED_UID && appid <= LAST_ISOLATED_UID) ||
+	       (appid >= FIRST_APP_ZYGOTE_ISOLATED_UID &&
+		appid <= LAST_APP_ZYGOTE_ISOLATED_UID);
 }
 
 static struct group_info root_groups = { .usage = ATOMIC_INIT(2) };
+
+static void setup_groups(struct root_profile *profile, struct cred *cred)
+{
+	if (profile->groups_count > KSU_MAX_GROUPS) {
+		pr_warn("Failed to setgroups, too large group: %d!\n",
+			profile->uid);
+		return;
+	}
+
+	if (profile->groups_count == 1 && profile->groups[0] == 0) {
+		// setgroup to root and return early.
+		if (cred->group_info)
+			put_group_info(cred->group_info);
+		cred->group_info = get_group_info(&root_groups);
+		return;
+	}
+
+	u32 ngroups = profile->groups_count;
+	struct group_info *group_info = groups_alloc(ngroups);
+	if (!group_info) {
+		pr_warn("Failed to setgroups, ENOMEM for: %d\n", profile->uid);
+		return;
+	}
+
+	int i;
+	for (i = 0; i < ngroups; i++) {
+		gid_t gid = profile->groups[i];
+		kgid_t kgid = make_kgid(current_user_ns(), gid);
+		if (!gid_valid(kgid)) {
+			pr_warn("Failed to setgroups, invalid gid: %d\n", gid);
+			put_group_info(group_info);
+			return;
+		}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
+		group_info->gid[i] = kgid;
+#else
+		GROUP_AT(group_info, i) = kgid;
+#endif
+	}
+
+	groups_sort(group_info);
+	set_groups(cred, group_info);
+}
 
 void escape_to_root(void)
 {
@@ -53,18 +103,36 @@ void escape_to_root(void)
 
 	cred = (struct cred *)__task_cred(current);
 
-	memset(&cred->uid, 0, sizeof(cred->uid));
-	memset(&cred->gid, 0, sizeof(cred->gid));
-	memset(&cred->suid, 0, sizeof(cred->suid));
-	memset(&cred->euid, 0, sizeof(cred->euid));
-	memset(&cred->egid, 0, sizeof(cred->egid));
-	memset(&cred->fsuid, 0, sizeof(cred->fsuid));
-	memset(&cred->fsgid, 0, sizeof(cred->fsgid));
-	memset(&cred->cap_inheritable, 0xff, sizeof(cred->cap_inheritable));
-	memset(&cred->cap_permitted, 0xff, sizeof(cred->cap_permitted));
-	memset(&cred->cap_effective, 0xff, sizeof(cred->cap_effective));
-	memset(&cred->cap_bset, 0xff, sizeof(cred->cap_bset));
-	memset(&cred->cap_ambient, 0xff, sizeof(cred->cap_ambient));
+	if (cred->euid.val == 0) {
+		pr_warn("Already root, don't escape!\n");
+		return;
+	}
+	struct root_profile *profile = ksu_get_root_profile(cred->uid.val);
+
+	cred->uid.val = profile->uid;
+	cred->suid.val = profile->uid;
+	cred->euid.val = profile->uid;
+	cred->fsuid.val = profile->uid;
+
+	cred->gid.val = profile->gid;
+	cred->fsgid.val = profile->gid;
+	cred->sgid.val = profile->gid;
+	cred->egid.val = profile->gid;
+
+	BUILD_BUG_ON(sizeof(profile->capabilities.effective) !=
+		     sizeof(kernel_cap_t));
+
+	// capabilities
+	memcpy(&cred->cap_effective, &profile->capabilities.effective,
+	       sizeof(cred->cap_effective));
+	memcpy(&cred->cap_inheritable, &profile->capabilities.effective,
+	       sizeof(cred->cap_inheritable));
+	memcpy(&cred->cap_permitted, &profile->capabilities.effective,
+	       sizeof(cred->cap_permitted));
+	memcpy(&cred->cap_bset, &profile->capabilities.effective,
+	       sizeof(cred->cap_bset));
+	memcpy(&cred->cap_ambient, &profile->capabilities.effective,
+	       sizeof(cred->cap_ambient));
 
 	// disable seccomp
 #if defined(CONFIG_GENERIC_ENTRY) &&                                           \
@@ -73,15 +141,16 @@ void escape_to_root(void)
 #else
 	current_thread_info()->flags &= ~(TIF_SECCOMP | _TIF_SECCOMP);
 #endif
+
+#ifdef CONFIG_SECCOMP
 	current->seccomp.mode = 0;
 	current->seccomp.filter = NULL;
+#else
+#endif
 
-	// setgroup to root
-	if (cred->group_info)
-		put_group_info(cred->group_info);
-	cred->group_info = get_group_info(&root_groups);
+	setup_groups(profile, cred);
 
-	setup_selinux();
+	setup_selinux(profile->selinux_domain);
 }
 
 int ksu_handle_rename(struct dentry *old_dentry, struct dentry *new_dentry)
@@ -161,12 +230,24 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 		}
 
 		// someone wants to be root manager, just check it!
-		// arg3 should be `/data/data/<manager_package_name>`
+		// arg3 should be `/data/user/<userId>/<manager_package_name>`
 		char param[128];
-		const char *prefix = "/data/data/";
 		if (copy_from_user(param, arg3, sizeof(param))) {
 			pr_err("become_manager: copy param err\n");
 			return 0;
+		}
+
+		// for user 0, it is /data/data
+		// for user 999, it is /data/user/999
+		const char *prefix;
+		char prefixTmp[64];
+		int userId = current_uid().val / 100000;
+		if (userId == 0) {
+			prefix = "/data/data";
+		} else {
+			snprintf(prefixTmp, sizeof(prefixTmp), "/data/user/%d",
+				 userId);
+			prefix = prefixTmp;
 		}
 
 		if (startswith(param, (char *)prefix) != 0) {
@@ -206,10 +287,6 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 			if (copy_to_user(result, &reply_ok, sizeof(reply_ok))) {
 				pr_err("grant_root: prctl reply error\n");
 			}
-		} else {
-			pr_info("deny root for: %d\n", current_uid());
-			// add it to deny list!
-			ksu_allow_uid(current_uid().val, false, true);
 		}
 		return 0;
 	}
@@ -304,6 +381,30 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 		return 0;
 	}
 
+	if (arg2 == CMD_UID_GRANTED_ROOT || arg2 == CMD_UID_SHOULD_UMOUNT) {
+		if (is_manager() || 0 == current_uid().val) {
+			uid_t target_uid = (uid_t)arg3;
+			bool allow = false;
+			if (arg2 == CMD_UID_GRANTED_ROOT) {
+				allow = ksu_is_allow_uid(target_uid);
+			} else if (arg2 == CMD_UID_SHOULD_UMOUNT) {
+				allow = ksu_uid_should_umount(target_uid);
+			} else {
+				pr_err("unknown cmd: %d\n", arg2);
+			}
+			if (!copy_to_user(arg4, &allow, sizeof(allow))) {
+				if (copy_to_user(result, &reply_ok,
+						 sizeof(reply_ok))) {
+					pr_err("prctl reply error, cmd: %d\n",
+					       arg2);
+				}
+			} else {
+				pr_err("prctl copy err, cmd: %d\n", arg2);
+			}
+		}
+		return 0;
+	}
+
 	// all other cmds are for 'root manager'
 	if (!is_manager()) {
 		last_failed_uid = current_uid().val;
@@ -311,19 +412,137 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 	}
 
 	// we are already manager
-	if (arg2 == CMD_ALLOW_SU || arg2 == CMD_DENY_SU) {
-		bool allow = arg2 == CMD_ALLOW_SU;
-		bool success = false;
-		uid_t uid = (uid_t)arg3;
-		success = ksu_allow_uid(uid, allow, true);
+	if (arg2 == CMD_GET_APP_PROFILE) {
+		struct app_profile profile;
+		if (copy_from_user(&profile, arg3, sizeof(profile))) {
+			pr_err("copy profile failed\n");
+			return 0;
+		}
+
+		bool success = ksu_get_app_profile(&profile);
 		if (success) {
+			if (copy_to_user(arg3, &profile, sizeof(profile))) {
+				pr_err("copy profile failed\n");
+				return 0;
+			}
 			if (copy_to_user(result, &reply_ok, sizeof(reply_ok))) {
 				pr_err("prctl reply error, cmd: %d\n", arg2);
 			}
 		}
-		ksu_show_allow_list();
 		return 0;
 	}
+
+	if (arg2 == CMD_SET_APP_PROFILE) {
+		struct app_profile profile;
+		if (copy_from_user(&profile, arg3, sizeof(profile))) {
+			pr_err("copy profile failed\n");
+			return 0;
+		}
+
+		// todo: validate the params
+		if (ksu_set_app_profile(&profile, true)) {
+			if (copy_to_user(result, &reply_ok, sizeof(reply_ok))) {
+				pr_err("prctl reply error, cmd: %d\n", arg2);
+			}
+		}
+		return 0;
+	}
+
+	return 0;
+}
+
+static bool is_appuid(kuid_t uid)
+{
+#define PER_USER_RANGE 100000
+#define FIRST_APPLICATION_UID 10000
+#define LAST_APPLICATION_UID 19999
+
+	uid_t appid = uid.val % PER_USER_RANGE;
+	return appid >= FIRST_APPLICATION_UID && appid <= LAST_APPLICATION_UID;
+}
+
+static bool should_umount(struct path *path)
+{
+	if (!path) {
+		return false;
+	}
+
+	if (current->nsproxy->mnt_ns == init_nsproxy.mnt_ns) {
+		pr_info("ignore global mnt namespace process: %d\n",
+			current_uid().val);
+		return false;
+	}
+
+	if (path->mnt && path->mnt->mnt_sb && path->mnt->mnt_sb->s_type) {
+		const char *fstype = path->mnt->mnt_sb->s_type->name;
+		return strcmp(fstype, "overlay") == 0;
+	}
+	return false;
+}
+
+static void try_umount(const char *mnt)
+{
+	struct path path;
+	int err = kern_path(mnt, 0, &path);
+	if (err) {
+		return;
+	}
+
+	// we are only interest in some specific mounts
+	if (!should_umount(&path)) {
+		return;
+	}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+	err = path_umount(&path, 0);
+	if (err) {
+		pr_info("umount %s failed: %d\n", mnt, err);
+	}
+#endif
+}
+
+int ksu_handle_setuid(struct cred *new, const struct cred *old)
+{
+	if (!new || !old) {
+		return 0;
+	}
+
+	kuid_t new_uid = new->uid;
+	kuid_t old_uid = old->uid;
+
+	if (0 != old_uid.val) {
+		// old process is not root, ignore it.
+		return 0;
+	}
+
+	// todo: check old process's selinux context, if it is not zygote, ignore it!
+
+	if (!is_appuid(new_uid)) {
+		// pr_info("handle setuid ignore non application uid: %d\n", new_uid.val);
+		return 0;
+	}
+
+	if (ksu_is_allow_uid(new_uid.val)) {
+		// pr_info("handle setuid ignore allowed application: %d\n", new_uid.val);
+		return 0;
+	}
+
+	if (!ksu_uid_should_umount(new_uid.val)) {
+		return 0;
+	} else {
+#ifdef CONFIG_KSU_DEBUG
+		pr_info("uid: %d should not umount!\n", current_uid().val);
+#endif
+	}
+
+	// umount the target mnt
+	pr_info("handle umount for uid: %d\n", new_uid.val);
+
+	// fixme: use `collect_mounts` and `iterate_mount` to iterate all mountpoint and
+	// filter the mountpoint whose target is `/data/adb`
+	try_umount("/system");
+	try_umount("/vendor");
+	try_umount("/product");
 
 	return 0;
 }
@@ -340,7 +559,14 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 	int option = (int)PT_REGS_PARM1(real_regs);
 	unsigned long arg2 = (unsigned long)PT_REGS_PARM2(real_regs);
 	unsigned long arg3 = (unsigned long)PT_REGS_PARM3(real_regs);
-	unsigned long arg4 = (unsigned long)PT_REGS_PARM4(real_regs);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
+	// PRCTL_SYMBOL is the arch-specificed one, which receive raw pt_regs from syscall
+	unsigned long arg4 = (unsigned long)PT_REGS_SYSCALL_PARM4(real_regs);
+#else
+	// PRCTL_SYMBOL is the common one, called by C convention in do_syscall_64
+	// https://elixir.bootlin.com/linux/v4.15.18/source/arch/x86/entry/common.c#L287
+	unsigned long arg4 = (unsigned long)PT_REGS_CCALL_PARM4(real_regs);
+#endif
 	unsigned long arg5 = (unsigned long)PT_REGS_PARM5(real_regs);
 
 	return ksu_handle_prctl(option, arg2, arg3, arg4, arg5);
@@ -360,7 +586,7 @@ static int renameat_handler_pre(struct kprobe *p, struct pt_regs *regs)
 	struct dentry *new_entry = rd->new_dentry;
 #else
 	struct dentry *old_entry = (struct dentry *)PT_REGS_PARM2(regs);
-	struct dentry *new_entry = (struct dentry *)PT_REGS_PARM4(regs);
+	struct dentry *new_entry = (struct dentry *)PT_REGS_CCALL_PARM4(regs);
 #endif
 
 	return ksu_handle_rename(old_entry, new_entry);
@@ -423,9 +649,16 @@ static int ksu_inode_rename(struct inode *old_inode, struct dentry *old_dentry,
 	return ksu_handle_rename(old_dentry, new_dentry);
 }
 
+static int ksu_task_fix_setuid(struct cred *new, const struct cred *old,
+			       int flags)
+{
+	return ksu_handle_setuid(new, old);
+}
+
 static struct security_hook_list ksu_hooks[] = {
 	LSM_HOOK_INIT(task_prctl, ksu_task_prctl),
 	LSM_HOOK_INIT(inode_rename, ksu_inode_rename),
+	LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid),
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
 	LSM_HOOK_INIT(key_permission, ksu_key_permission)
 #endif
